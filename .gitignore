@@ -1,0 +1,25 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# Julia artifacts
+/Manifest.toml
+/Manifest.*.toml
+/Project.toml
+/Project.*.toml
+/deps/
+/artifacts/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Editors
+.vscode/
+/.idea/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Logs
+*.log
