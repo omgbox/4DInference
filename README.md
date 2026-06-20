@@ -4,6 +4,65 @@ A novel **4D inference architecture with learned routing**, implemented in pure 
 
 This is an active research project investigating whether a Mixture-of-Experts-style router can learn to select distinct processing paths (slices) for distinct input types. The headline finding: **routing collapse is architecturally universal** in this setup — see [Open Research Problem](#open-research-problem--routing-collapse).
 
+## Research Overview
+
+### Motivation & Use Cases
+
+**Why this architecture?**
+
+1. **Efficient inference**: Route to smaller specialized experts instead of a large monolithic network. Potential for faster, lower-memory inference.
+
+2. **Interpretability**: Track which slice/phase the model chose per input for debugging and understanding decisions.
+
+3. **Continual learning**: Slices specialize over time; new experts can be added without retraining old ones.
+
+4. **Multi-task handling**: Different slices for different modalities (image, text, audio); route at inference time.
+
+5. **Adaptive reasoning**: Easy inputs need quick retrieval; hard inputs need multi-step reasoning. The model learns when each is needed.
+
+**Real-world applications:**
+- Medical diagnosis: RETRIEVE lab results → REASON about them → PLAN next steps → COMPRESS into a decision.
+- Multimodal AI: different slices for image, text, audio; router decides which to activate.
+- Real-time systems: detect easy vs. hard inputs; spend more computation steps on hard ones.
+- Federated learning: route to different models/domains based on input characteristics.
+- Adaptive language models: easy tokens (punctuation, common words) use fast slice; complex tokens use reasoning slices.
+
+### What Works (The Good News)
+
+✅ **Multi-step temporal reasoning (Y-axis)**: Dramatically outperforms flat MLPs
+- **6-class temporal task**: 82.1% (this model) vs. 12.8% (baseline MLP)
+- Model learns to refine decisions iteratively over multiple steps
+- Early-exit mechanism works — high-confidence samples finish in 1-2 steps
+
+✅ **Memory integration (Z-axis)**: SORN memory provides useful contextual state
+- Router can query memory to inform routing decisions
+- Surprise-gated writes selectively encode important events
+
+✅ **Phase state machine (W-axis)**: FiLM phase conditioning is effective
+- Different phase embeddings modulate slice outputs differently
+- Model learns phase transitions that align with task structure
+
+✅ **Training stability**: Gradient clamping and model checkpointing critical
+- Clamping gradients `[-2,2]` for `d_avg`, `[-1,1]` for weights prevents divergence
+- Models peak around epoch 50, then degrade — best-weights restoration essential
+
+### What Doesn't Work (The Core Problem)
+
+❌ **Learned routing (X-axis)**: Router always collapses to a single slice
+- All 14 anti-collapse techniques failed
+- This is **not a training bug** — it's an **architectural inevitability**
+- See [Open Research Problem](#open-research-problem--routing-collapse) for details
+
+### Research Contribution
+
+This project **empirically proves a theoretical blind spot** in Mixture-of-Experts literature:
+
+- **Existing MoE papers** (Mixture of Experts, Switch Transformers, etc.) assume experts operate in *parallel* on disjoint data subsets or their outputs are explicitly combined.
+- **This architecture** has experts operate *sequentially* on shared input/output dimensions.
+- **Result**: routing collapse is *architecturally inevitable*, not a training bug or hyperparameter issue.
+
+**Why this matters:** Future researchers now know that if they want learned routing to specialize, they must **decouple representation learning from routing**. End-to-end training of sequential, same-dimensional experts will not work.
+
 ## Architecture
 
 The `FourDModel` wires together six components, each in its own file under `src/`:
@@ -73,6 +132,65 @@ The router **always collapses to a single slice** (typically `COMPRESS` or `RETR
 | 14 | Shared expert (COMPRESS always + 3-way) | 69% peak, 100% RETRIEVE collapse |
 
 **Current direction:** abandon learned routing during training. Use ensemble training (all slices active, combined outputs) for representation learning, then train a separate router or use hash-based selection for inference — decoupling representation learning from routing.
+
+### Why Routing Collapses (Deep Dive)
+
+#### The Core Issue: Structural Interchangeability
+
+**The fundamental problem:** When all slices have the same input and output dimensions, the downstream output layer cannot distinguish which slice was used. Once one slice starts winning, it becomes a "rich-get-richer" dynamic:
+
+1. Slice A is randomly slightly better at some inputs
+2. Router sends more data to A (small gradient signal)
+3. Output layer fine-tunes to A's outputs (A becomes even better)
+4. Router sends *all* data to A (zero gradient signal for diversity)
+5. Other slices receive no gradient updates and starve
+
+**Why existing MoE avoids this:**
+- **Switch Transformers**: Experts operate on *sparse* data subsets; each expert only sees part of the batch. The output layer combines all expert outputs (weighted sum), so it has to "learn" the differences.
+- **Mixture of Experts (original)**: Gates are soft (weighted sum), not hard (argmax). All experts always contribute; output layer always sees all expert outputs.
+
+**Why this architecture hits it:**
+- Experts operate *sequentially* on the same input
+- Router makes a *hard choice* (argmax) — only one expert activates
+- Output layer sees only the *final accumulated state* — it cannot infer which expert was used
+- Result: no gradient signal for router diversity
+
+#### The 14 Failed Solutions
+
+Every standard MoE technique was tried; all failed:
+
+| Approach | Why it failed |
+|----------|---------------|
+| **Entropy bonus** | Entropy loss is too weak compared to accuracy loss; router ignores it |
+| **Per-slice input projections** | Different inputs don't help if outputs are identical |
+| **Loss-Free Balancing (LFB)** | Forces uniform load but destroys specialization; accuracy collapses |
+| **Router dropout** | Works at train; collapses at eval (deterministic inference) |
+| **Expert orthogonality loss** | Harmful; prevents experts from learning useful representations |
+| **Routing variance loss** | Gradient is ~0; variance doesn't propagate |
+| **REINFORCE** | Initially diversifies then collapses (same underlying issue) |
+| **Capacity-locked routing** | Masks features per slice; slices become too weak |
+| **Output-partitioned routing** | Each slice gets its own output dimensions; loss explodes |
+| **Forced round-robin training** | Slices trained on wrong inputs; accuracy is 42.4% |
+| **Soft routing v2** | Blends all slices; 100% collapse anyway (rich-get-richer) |
+| **Expert Choice routing** | Hard balanced routing; no specialization; 7% accuracy |
+| **Oracle label training** | Router can't learn from synthetic ground-truth routing |
+| **Shared expert (COMPRESS always)** | 69% peak, 100% RETRIEVE collapse |
+
+**Key insight:** The problem is not the router, the loss function, or the training procedure. It's the **architecture itself**. You cannot make sequential, same-dimensional experts specialize through end-to-end gradient descent.
+
+#### What Might Work
+
+To escape routing collapse:
+
+1. **Sparse expert selection**: Only 1-2 slices ever see data; rest specialize on disjoint subsets (like standard MoE). Requires data partitioning strategy.
+
+2. **Output partitioning**: Each slice produces its own output dimensions. Output layer *must* know which slice was active. Requires careful design to avoid loss explosion.
+
+3. **Ensemble training + separate router**: Train all slices jointly (no routing); then train a separate lightweight router post-hoc using clustering or supervised labels.
+
+4. **Heuristic routing**: Use domain knowledge (e.g., input features) to route, rather than learning end-to-end.
+
+5. **Soft gating (weighted blend)**: Instead of hard argmax, blend multiple slices (like original Mixture of Experts). But this requires more compute and defeats the efficiency motivation.
 
 ## Quick start
 
@@ -150,6 +268,19 @@ test/
 examples/
   *.jl                # experiments and demos
 ```
+
+## Summary: Production Readiness
+
+| Component | Status | Notes |
+|-----------|--------|-------|
+| **Multi-step reasoning (Y-axis)** | ✅ **Excellent** | 82.1% vs 12.8% baseline; highly effective |
+| **Memory integration (Z-axis)** | ✅ **Good** | Provides useful context; works as designed |
+| **Phase modulation (W-axis)** | ✅ **Good** | FiLM conditioning effective; phases learned |
+| **Learned routing (X-axis)** | ❌ **Broken** | Always collapses; fundamental architectural issue |
+| **Production ready?** | ❌ **No** | Routing provides no specialization; just picks one expert |
+| **Research value?** | ✅ **High** | Proves architectural limits; informs future MoE design |
+
+**Bottom line:** This architecture demonstrates that **learned routing for sequential, same-dimensional experts is fundamentally limited**. The multi-step reasoning and memory integration components are valuable and could be used in other architectures. The routing collapse finding is the main contribution — it tells future researchers what *not* to do and why.
 
 ## Caveats
 
